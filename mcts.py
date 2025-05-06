@@ -13,41 +13,43 @@ from models import BaseNN
 from utils import get_freer_gpu
 from players import Player, NNPlayer, RandomPlayer, BestPlayer
 
+# 실험에 사용할 하이퍼파라미터 설정
 if False:
     config = {
-        'game': 'ttt', # ttt
-        'n_sim': 100, # 1600
-        'n_gen_games': 90, # 1000
-        'n_train_iter': 100, # 1000
+        'game': 'ttt', # 게임 종류: 틱택토
+        'n_sim': 100, # MCTS 시뮬레이션 횟수
+        'n_gen_games': 90, # self-play로 생성할 게임 수
+        'n_train_iter': 100, # 신경망 학습 반복 횟수
         'batch_size': 1024,
-        'n_games_eval': 45, # 100
-        'n_iter': 10,
-        'n_jobs': 90,
+        'n_games_eval': 45, # 평가용 게임 수
+        'n_iter': 10, # 전체 반복 횟수
+        'n_jobs': 90, # 병렬 처리 작업 수
     }
 else:
     config = {
-        'game': 'ttt', # ttt
-        'n_sim': 4,
-        'n_gen_games': 50, # 1000
-        'n_train_iter': 100, # 1000
+        'game': 'ttt', # 게임 종류: 틱택토
+        'n_sim': 4, # MCTS 시뮬레이션 횟수(빠른 실험용)
+        'n_gen_games': 50, # self-play로 생성할 게임 수
+        'n_train_iter': 100, # 신경망 학습 반복 횟수
         'batch_size': 1024,
-        'n_games_eval': 100,
-        'n_iter': 51,
-        'n_jobs': 50,
+        'n_games_eval': 100, # 평가용 게임 수
+        'n_iter': 51, # 전체 반복 횟수
+        'n_jobs': 50, # 병렬 처리 작업 수
     }
 
+# MCTS(몬테카를로 트리 탐색) 클래스
 class MCTS:
     def __init__(self, gameEngine: GameEngine, c=1.0, n_sim=config['n_sim'], single_thread=False, device=None):
         super().__init__()
 
-        self.ge = gameEngine
+        self.ge = gameEngine  # 게임 엔진(틱택토 등)
         self.device = "cpu" if device is None else device
 
-        self.c = c
-        self.n_sim = n_sim
-        self.alpha = 0.03
-        self.eps_exploration = 0.25
-        self.num_sampling_moves = 30
+        self.c = c  # PUCT 상수
+        self.n_sim = n_sim  # 시뮬레이션 횟수
+        self.alpha = 0.03  # Dirichlet 노이즈 파라미터
+        self.eps_exploration = 0.25  # 탐험 비율
+        self.num_sampling_moves = 30  # 확률적으로 수를 고르는 턴 수
 
         self.single_thread = single_thread
         if self.single_thread:
@@ -56,9 +58,11 @@ class MCTS:
             manager = multiprocessing.Manager()
             self.model = manager.dict()
 
-    def puct_score(self, sqrt_N, n, p, q): # TODO: update c = log((1 + N + c_1) / c_1) + c_0
+    # PUCT 점수 계산 (탐험/이용 균형)
+    def puct_score(self, sqrt_N, n, p, q):
         return q + self.c * p * sqrt_N / (1 + n)
 
+    # 현재 상태에서 가장 좋은 수 선택
     def bestMove(self, moves, N, P, Q):
         max_u, best_a_i = -float("inf"), np.random.choice(len(moves))
         sqrt_N = np.sqrt(1+np.sum(N))
@@ -71,16 +75,17 @@ class MCTS:
                 best_a_i = a_i
         return best_a_i, moves[best_a_i]
 
+    # 노드 확장: 신경망으로 정책/가치 예측, 트리에 추가
     def expand(self, nnet, N, P, Q, s, hs=None, zero=False):
-        if hs is None:
+        if hs is None: # 처음에는 hs 가 None 임. 따라서, hash 로 정의해줌. hash(tuple(game[-1].numpy().flatten())) 로 구성되어있음
             hs = self.ge.hash(s)
-        if zero or hs not in self.model:
-            self.model[hs] = nnet.predict(self.ge.encodeState(s, device=self.device))
-        model_v, model_P = self.model[hs]
+        if zero or hs not in self.model: # zero 가 true 면 predict() 를 강제로 넣어줌. 처음에는 False 임. self.model 은 딕셔너리임. self.model[hs] 의 키 값이 없으면 실행되는것
+            self.model[hs] = nnet.predict(self.ge.encodeState(s, device=self.device)) # encodeState() 는 리스트 s 중 현재 s[-1] 를 가져옴.
+        model_v, model_P = self.model[hs] # hs(state의 hash 임. 즉 게임판 위치). model_v 는 1개가 나오고, model_P 는 9개(3x3 보드판)가 나옴.
 
-        moves = self.ge.legalMoves(s)
+        moves = self.ge.legalMoves(s) # 게임판에서 점유하지 않은 공간 정보 반환
         P[hs] = []
-        for move in moves:
+        for move in moves: # BaseNN 으로 예측한 model_P(Policy) 값을 P[hs] 에 업데이트 하기 위한 작업. 
             i = -1
             if config['game'] == 'ttt':
                 for j in range(len(self.ge.allMoves())):
@@ -90,51 +95,65 @@ class MCTS:
             else:
                 raise NotImplementedError
             assert i != -1
-            P[hs].append(model_P[i])
-        Q[hs] = [0.] * len(moves)
-        N[hs] = [0] * len(moves)
+            P[hs].append(model_P[i]) # 위에서 계산된 model_P[i] 값에 해당하는 hs 찾아서 P[hs] 에 추가
+        Q[hs] = [0.] * len(moves) # 모두 0으로 초기화
+        N[hs] = [0] * len(moves) # 모두 0으로 초기화
 
         return model_v
 
+    # MCTS 트리 탐색 및 백업
     def search(self, s, nnet, N, P, Q):
         actions = []
-        hs = self.ge.hash(s)
+        hs = self.ge.hash(s) # 루트노드 가져오는 과정임 (현재(마지막) s[루트노드 게임판들] 의 hash 값을 가져옴)
 
+        # 게임이 끝나지 않았고, 이미 확장된 노드라면 계속 탐색
+        # N[hs][a] : a 는 [0, 0, 3] 같이 리스트로 이뤄짐. 
+        #     여기서 이 값은 moves 의 index 순서 그대로임. 즉, [0, 0, 3] 은 moves[0] 이 0번, moves[1] 이 0번, moves[2]가 3번 방문됬다는 뜻
+        # move_i 는 moves 의 index 임 (moves_i: 3 이면,)
         while not self.ge.gameOver(s) and hs in N:
-            moves = self.ge.legalMoves(s)
-            move_i, move = self.bestMove(moves, N[hs], P[hs], Q[hs])
+            moves = self.ge.legalMoves(s) # s 에서 빈칸 찾아서 반환
+            # move_i 는 moves 중에 몇 번째인지 인덱스 반환이고, 인덱스로 선택된 moves 를 move에 저장하는 것
+            move_i, move = self.bestMove(moves, N[hs], P[hs], Q[hs]) # PCTU Score 계산해서 가장 좋은 수 선택
 
             actions.append((hs, move_i))
-            s = self.ge.makeMove(s, move)
-            hs = self.ge.hash(s)
+            s = self.ge.makeMove(s, move) # 결정된 수 두는 곳
+            hs = self.ge.hash(s) # 위에서 선택이 이전 판과 동일하면, 이전에 선택한 hs 값이 나올거임. 이게 핵심. (새로운 hs 를 만들어줌)
 
+        # 게임이 끝났으면 결과 반환, 아니면 노드 확장
         if self.ge.gameOver(s):
             v = self.ge.outcome(s)
-        else:
-            v = self.expand(nnet, N, P, Q, s, hs=hs, zero=True)
+        else: # 위에서 hs 가 새로 만들어져서 expand() 의 매개변수로 넣어줬으므로, 결과값에서 hs 값이 유지됨
+            v = self.expand(nnet, N, P, Q, s, hs=hs, zero=True) # P, v 에 모델(BaseNN) 결과값 넣고, N, Q 초기화상태
 
-        for hs, move_i in actions[::-1]:
-            v = -v
+        # 백업(역방향으로 결과 전파)
+        for hs, move_i in actions[::-1]: # 탐색 경로를 역순으로 순회
+            v = -v # 현재는 플레이어 입장이므로, 이전은 상대이므로 부호 반전
             Q[hs][move_i] = (Q[hs][move_i] * N[hs][move_i] + v) / (N[hs][move_i] + 1)
             N[hs][move_i] += 1
 
         return v
 
+    # 현재 상태에서 여러 번 시뮬레이션을 돌려 정책(확률 분포) 생성
     def policy(self, s, nnet, gen: np.random.Generator | None, progress=None):
         hs = self.ge.hash(s)
-        N = {}
-        P = {} # P[s][a] is the probability evaluated by nnet of playing a in state s
-        Q = {} # Q[s][a] is the average outcome of playing a in state s
+        N = {} # N[s][a]: 특정 상태에서 특정 수를 선택한 횟수 (방문 횟수)
+        P = {} # P[s][a]: 신경망이 평가한 확률 (사전 확률)
+        Q = {} # Q[s][a]: 평균 가치 (행동 가치)
 
+        # Dirichlet 노이즈로 탐험성 부여
+        # 매번 같은 방식으로 수를 고르면, 데이터 편향 발생함. dirichlet 분포 노이즈 넣는거임.
         if gen is None:
             dir_noise = np.ones(len(self.ge.legalMoves(s)))
         else:
-            dir_noise = gen.dirichlet([self.alpha] * len(self.ge.legalMoves(s)))
+            dir_noise = gen.dirichlet([self.alpha] * len(self.ge.legalMoves(s))) # 탐험을 촉진하기 위한 노이즈 추가
 
-        self.expand(nnet, N, P, Q, s, hs=hs)
-        for i, noise in enumerate(dir_noise):
+        self.expand(nnet, N, P, Q, s, hs=hs) # 모델 예측 값을 가져옴. (BaseNN) / model_v 결과값은 1개 나오는데, 버려짐!!! (학습에 쓰지 않기 때문) -> 이 구조는 P, Q, N 딕셔너리 구조를 초기화하려는 것
+        for i, noise in enumerate(dir_noise): # expand() 에서 생된 각 보드판(hs) 의 각각의 자리(3x3)에 P 값에 
             P[hs][i] = P[hs][i] * (1 - self.eps_exploration) + noise * self.eps_exploration
 
+        
+        # 아래는 시뮬레이션/탐험 단계 (search() 함수 n_sim[4회] 호출; MCTS 트리 탐색)
+        # 여기서 생성되는 시뮬레이션들은 정책값(P)에 dirichlet 노이즈 넣지 않음 -> 실제 모델의 정책(P)에 따라 전개되어야만 함
         task = None
         if progress is not None:
             task = progress[0].add_task(f"[cyan]{progress[1]}: [magenta]Generating Policy", total=self.n_sim)
@@ -150,6 +169,7 @@ class MCTS:
             for a_i, a in enumerate(moves)
         }
 
+    # 여러 게임을 생성하여 학습 데이터(상태, 정책, 가치) 생성
     def gen_data(self, nnet, n_games=25_000, max_len=-1, progress=None, device=None):
         task = None
         if progress is not None:
@@ -157,31 +177,34 @@ class MCTS:
 
         def gen_game(gen: np.random.Generator):
             examples_per_game = []
-            game = self.ge.startingPosition()
-            while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len):
+            game = self.ge.startingPosition() # 처음에는 3x3 모든 원소가 0임.
+            while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len): # gameOver 될 때 까지 도는데, max_len 만큼만 도는 것임.
                 pi = self.policy(game, nnet, gen)
-                examples_per_game.append([game.copy(), pi])
+                examples_per_game.append([game.copy(), pi]) # append 는 리스트 값을 하나 맨 뒤에 추가하는 것
 
-                moves = self.ge.legalMoves(game)
+                moves = self.ge.legalMoves(game) # 보드에서 빈 칸(놓을 수 있는) 찾아서 반환
 
                 p_pi = [pi[move] for move in moves]
                 if len(examples_per_game) < self.num_sampling_moves:
                     move = moves[gen.choice(len(moves), p=p_pi)]
                 else:
                     move = moves[np.argmax(p_pi)]
-                game = self.ge.makeMove(game, move)
+                game = self.ge.makeMove(game, move) # 자리에 놓기 액션
             result = self.ge.outcome(game) * (-1) ** len(examples_per_game)
             for example in examples_per_game:
                 example.append(result)
                 result = -result
             return examples_per_game
 
+        # 병렬로 여러 게임 생성
+        # examples 에 시뮬레이션된 게임들이 모여짐
+        # 총 n_jobs(50)개의 게임판이 생기고, 각 게임판에서 게임이 끝날 때까지 시뮬레이션(현재는 4회; config 의 n_sim 값) 돌림
         examples: Any = Parallel(
             n_jobs=config['n_jobs'],
             batch_size=1, # type: ignore
             return_as='generator'
         )(
-            delayed(gen_game)(np.random.default_rng(np.random.randint(int(1e10))))
+            delayed(gen_game)(np.random.default_rng(np.random.randint(int(1e10)))) # self-play 돌리는 부분
             for _ in range(n_games)
         )
         data = []
@@ -267,13 +290,14 @@ def pit(player1: Player, opponents: dict[str, Player], gameEngine: GameEngine, n
 
 def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
     nnet = config['model']().to(device[1])
-    oldPlayer = NNPlayer(nnet, MCTS(gameEngine, device=device[1]), id="init")
+    oldPlayer = NNPlayer(nnet, MCTS(gameEngine, device=device[1]), id="init") # 학습 과정에서 이전 모델을 저장하는 용도로 사용
     randomPlayer = RandomPlayer(gameEngine)
     bestPlayer = BestPlayer(MCTS(gameEngine, device=device[1]), config, gameEngine)
 
     dpi = 96
     steps = []
     plt.figure(figsize=(1920/dpi, 1080/dpi), dpi=dpi)
+    # with Progress 는 커맨드라인에 Bar 만드는 시각화 툴임. 뒤에 progress.add_task() 까지. 그 뒤에 값들 넣어서 progress.update() 하는 식으로 사용함.
     with rp.Progress(
         *rp.Progress.get_default_columns(),
         rp.TimeElapsedColumn(),
@@ -293,6 +317,8 @@ def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
             # new_nnet = BaseNN().to(device)
             new_nnet = copy.deepcopy(nnet).to(device[0])
 
+            # BaseNN 의 fit() 함수는 데이터를 받아서 학습을 진행함.
+            # 생성하나 게임 (n_gen_games) 만큼의 결과를 모아서 한 번에 학습 진행 (fit 함수가 그 역할 함)
             losses = new_nnet.fit(
                 data,
                 n_iter=config['n_train_iter'],
@@ -300,8 +326,10 @@ def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
                 progress=(progress, i),
             )
 
+            # 학습된 모델을 가져옴.
             newPlayer = NNPlayer(new_nnet.to(device[1]), MCTS(gameEngine, device=device[1]), id=f'Step{i:03}')
 
+            # 학습된 모델과 랜덤 모델, 기존 모델, 최고 모델을 비교하여 결과 출력
             results = pit(
                 newPlayer,
                 {
@@ -316,6 +344,7 @@ def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
             )
             print(results)
 
+            # 학습된 모델을 기존 모델로 업데이트
             nnet = new_nnet
             oldPlayer = newPlayer
 
@@ -386,5 +415,7 @@ if __name__ == "__main__":
         config['model'] = BaseNN
     else:
         raise NotImplementedError
+    
+
     nnet = finalnet(gameEngine, iterations=config['n_iter'], n_games_eval=config['n_games_eval'], device=[device, device2])
     torch.save(nnet.state_dict(), f'./models/{config["game"]}best.pt')

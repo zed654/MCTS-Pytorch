@@ -31,6 +31,8 @@ class BaseNN(torch.nn.Module):
         self.policy_output = torch.nn.Linear(hidden_size, 9)
 
     def forward(self, x):
+        # 신경망의 순전파
+        # 입력 -> 정책(policy)과 가치(value) 출력
         x = x.float()
         x = x.reshape(*x.shape[:-2], -1)
         for layer in self.layers:
@@ -38,12 +40,16 @@ class BaseNN(torch.nn.Module):
         return self.evaluation_output(x).squeeze(dim=-1), self.policy_output(x)
 
     def predict(self, x):
-        v, P = self(x)
-        v = v.item()
-        P = softmax(P.squeeze().detach().numpy())
+        # forward를 사용해서 예측
+        # state -> (value, policy) 반환
+        v, P = self(x) # self(x) 는 forward 함수를 호출하는 것임.
+        v = v.item() # 예측된 가치 값을 스칼라로 변환
+        P = softmax(P.squeeze().detach().numpy()) # 예측된 정책 값을 소프트맥스 함수를 사용해 확률로 변환
         return v, P
 
     def fit(self, data, n_iter=None, batch_size=None, lr=None, progress=None):
+        # 학습 데이터로 신경망 학습
+        # loss 계산, 역전파, 가중치 업데이트
         if n_iter is not None:
             self.n_iter = n_iter
 
@@ -95,6 +101,8 @@ class BaseNN(torch.nn.Module):
         return losses
 
     def id(self):
+        # 모델의 고유 식별자 반환
+        # 저장된 모델 구분용
         return f'BaseNN-{self.n_layers}-{self.hidden_size}-{self.n_iter}-{self.batch_size}-{self.lr}_{self.uid}'
 
 
