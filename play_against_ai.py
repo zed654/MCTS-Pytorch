@@ -71,15 +71,15 @@ def test_game_functionality():
     game = gameEngine.startingPosition()
     current_player = 1  # X 먼저 시작
     
-    # 3턴만 진행
-    for turn in range(6):
-        if gameEngine.gameOver(game):
-            break
+    # 게임이 끝날 때까지 진행
+    turn = 0
+    while not gameEngine.gameOver(game):
+        turn += 1
             
-        print(f"\n턴 {turn+1} (플레이어: {'X' if current_player == 1 else 'O'})")
+        print(f"\n턴 {turn} (플레이어: {'X' if current_player == 1 else 'O'})")
         gameEngine.print(game, ("테스트", turn), "테스트/AI")
         
-        if turn % 2 == 0:  # 사용자 플레이어 턴
+        if (turn-1) % 2 == 0:  # 사용자 플레이어 턴
             legal_moves = gameEngine.legalMoves(game)
             
             # 가능한 수 표시
