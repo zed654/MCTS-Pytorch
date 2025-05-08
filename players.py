@@ -60,9 +60,26 @@ class NNPlayer(Player):
 
 def BestPlayer(mcts, config, gameEngine: GameEngine, id='') -> Player:
     id = f'Best{id}'
-    if os.path.isfile(f'./models/{config["game"]}best.pt'):
-        nnet = config['model']()
-        nnet.load_state_dict(torch.load(f'./models/{config["game"]}best.pt'))
+    model_type = "muzero" if config['use_muzero'] else "alphazero"
+    model_file = f'./models/{config["game"]}_{model_type}_best.pt'
+    
+    # 모델 파일이 없으면 RandomPlayer 반환
+    if not os.path.isfile(model_file):
+        return RandomPlayer(gameEngine, id=id)
+    
+    # MuZero 모드인지 AlphaZero 모드인지에 따라 적절한 모델 선택
+    from models import MuZeroNN, BaseNN
+    if config['use_muzero']:
+        nnet = MuZeroNN(hidden_size=32)
+    else:
+        nnet = BaseNN()
+    
+    # 모델 로드 시도
+    try:
+        nnet.load_state_dict(torch.load(model_file))
         return NNPlayer(nnet, mcts, id=id)
-
-    return RandomPlayer(gameEngine, id=id)
+    except Exception as e:
+        print(f"모델 로드 중 오류: {e}")
+        print(f"기존 모델 파일({model_file})의 형식이 현재 선택된 모델 타입({model_type})과 일치하지 않습니다.")
+        print("랜덤 플레이어를 대신 사용합니다.")
+        return RandomPlayer(gameEngine, id=id)
