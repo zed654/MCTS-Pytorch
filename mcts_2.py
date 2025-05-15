@@ -25,6 +25,7 @@ if True:
         'n_iter': 10, # 전체 반복 횟수
         'n_jobs': 90, # 병렬 처리 작업 수
         'use_muzero': True, # MuZero 알고리즘 사용 여부
+        'n_unroll_steps': 3, # 몬테카를로 트리 탐색 시 탐색 깊이
     }
 else:
     config = {
@@ -37,6 +38,7 @@ else:
         'n_iter': 51, # 전체 반복 횟수
         'n_jobs': 50, # 병렬 처리 작업 수
         'use_muzero': True, # MuZero 알고리즘 사용 여부
+        'n_unroll_steps': 3, # 몬테카를로 트리 탐색 시 탐색 깊이
     }
 
 # MCTS(몬테카를로 트리 탐색) 클래스
@@ -199,7 +201,7 @@ class MCTS:
         }
 
     # 여러 게임을 생성하여 학습 데이터(상태, 정책, 가치) 생성
-    def gen_data(self, nnet, n_games=25_000, max_len=-1, progress=None, device=None):
+    def gen_data(self, nnet, n_games=25_000, max_len=-1, progress=None, device=None, K=3):
         task = None
         if progress is not None:
             task = progress[0].add_task(f"[cyan]{progress[1]}: [green]Generating Data", total=n_games, arg1_n="#positions", arg1=0)
@@ -222,17 +224,25 @@ class MCTS:
                     result = -result
                 return examples
             else:
-                # Existing MuZero version (unchanged)
+                # MuZero K-step rollout data generation
                 examples_per_game = []
                 game = self.ge.startingPosition()
                 latent_game = self.ge.representation(game[-1])
                 prev_state = game.copy()
-                prev_latent = latent_game # 추후 self.ge.dynamics(prev_latent, move) 로 테스트해보면 좋을듯
-                while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len):
+                prev_latent = latent_game
+                states_seq = []
+                policies_seq = []
+                values_seq = []
+                actions_seq = []
+                rewards_seq = []
+                next_states_seq = []
+                # For K-step: collect sequences per sample
+                # Play through the game, collect all transitions
+                while not self.ge.gameOver(game) and (max_len == -1 or len(states_seq) < max_len):
                     pi = self.policy(game, nnet, gen)
                     moves = self.ge.legalMoves(game)
                     p_pi = [pi[move] for move in moves]
-                    if len(examples_per_game) < self.num_sampling_moves:
+                    if len(states_seq) < self.num_sampling_moves:
                         move_idx = gen.choice(len(moves), p=p_pi)
                     else:
                         move_idx = np.argmax(p_pi)
@@ -244,17 +254,57 @@ class MCTS:
                     elif hasattr(self.ge, 'reward'):
                         reward = self.ge.reward(game, move, game_next)
                     latent_game_new, _ = self.ge.dynamics(latent_game, move)
-                    examples_per_game.append([
-                        prev_state.copy(), pi, None, move, reward, game_next.copy()
-                    ])
+                    # Store per-step
+                    states_seq.append(prev_state.copy())
+                    policies_seq.append(pi)
+                    values_seq.append(None)  # Placeholder, to fill after game ends
+                    actions_seq.append(move)
+                    rewards_seq.append(reward)
+                    next_states_seq.append(game_next.copy())
                     latent_game = latent_game_new
                     prev_state = game_next.copy()
                     game = game_next
-                result = self.ge.outcome(game) * (-1) ** len(examples_per_game)
-                for example in examples_per_game:
-                    example[2] = result
+                # Now, for each position, compute value from end
+                result = self.ge.outcome(game) * (-1) ** len(states_seq)
+                value_seq = []
+                for _ in range(len(states_seq)):
+                    value_seq.append(result)
                     result = -result
-                return examples_per_game
+                # For K-step, build rollout sequences: for each position, build up to K steps
+                data_samples = []
+                n = len(states_seq)
+                for start in range(n):
+                    # For each start index, build a rollout of up to K steps
+                    k_actions = []
+                    k_rewards = []
+                    for k in range(K):
+                        idx = start + k
+                        if idx < n:
+                            # Convert action to index
+                            action = actions_seq[idx]
+                            if isinstance(action, int):
+                                action_idx = action
+                            else:
+                                try:
+                                    action_idx = self.ge.allMoves().index(action)
+                                except Exception:
+                                    action_idx = int(action)
+                            k_actions.append(action_idx)
+                            k_rewards.append(rewards_seq[idx])
+                        else:
+                            # Padding: repeat last action/reward (or 0)
+                            k_actions.append(0)
+                            k_rewards.append(0.0)
+                    # Compose sample: (state, policy, value, actions[K], rewards[K], next_state)
+                    data_samples.append([
+                        states_seq[start],
+                        policies_seq[start],
+                        torch.tensor([value_seq[start]], dtype=torch.float32),
+                        k_actions,
+                        k_rewards,
+                        next_states_seq[start]
+                    ])
+                return data_samples
 
         # 병렬로 여러 게임 생성
         # examples 에 시뮬레이션된 게임들이 모여짐
@@ -264,30 +314,23 @@ class MCTS:
             batch_size=1, # type: ignore
             return_as='generator'
         )(
-            delayed(gen_game)(np.random.default_rng(np.random.randint(int(1e10)))) # self-play 돌리는 부분
+            delayed(gen_game)(np.random.default_rng(np.random.randint(int(1e10))))
             for _ in range(n_games)
         )
         data = []
         for gameData in examples:
             if self.is_muzero:
-                # gameData: list of (state, policy, value, action, reward, next_state)
-                for state, policy, value, action, reward, next_state in gameData:
-                    # Encode state and next_state for NN input
+                # Detect if K-step data (list of lists)
+                # Each gameData is a list of samples: (state, policy, value, actions[K], rewards[K], next_state)
+                for sample in gameData:
+                    state, policy, value, actions, rewards, next_state = sample
                     state_enc, policy_enc, value_enc = self.ge.encodeStateAndOutput(state, policy, value, device=self.device if device is None else device)
                     next_state_enc, _, _ = self.ge.encodeStateAndOutput(next_state, policy, value, device=self.device if device is None else device)
-                    # action index (int 0-8)
-                    if isinstance(action, int):
-                        action_idx = action
-                    else:
-                        # If action is move tuple, convert to index
-                        try:
-                            action_idx = self.ge.allMoves().index(action)
-                        except Exception:
-                            action_idx = int(action)
-                    reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device if device is None else device)
-                    data.append((state_enc, policy_enc, value_enc, action_idx, reward_tensor, next_state_enc))
+                    # actions: list of K
+                    actions_tensor = torch.tensor(actions, dtype=torch.long, device=state_enc.device)
+                    rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=state_enc.device)
+                    data.append((state_enc, policy_enc, value_enc, actions_tensor, rewards_tensor, next_state_enc))
             else:
-                # AlphaZero: (state, policy, value)
                 for state, policy, value, _, _, _ in gameData:
                     data.append(self.ge.encodeStateAndOutput(state, policy, value, device=self.device if device is None else device))
             if progress is not None:
@@ -407,6 +450,7 @@ def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
                 n_iter=config['n_train_iter'],
                 batch_size=config['batch_size'],
                 progress=(progress, i),
+                K=config['n_unroll_steps']
             )
 
             # MCTS 인스턴스 생성 (MuZero 모드 여부에 따라)

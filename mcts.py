@@ -14,7 +14,7 @@ from utils import get_freer_gpu
 from players import Player, NNPlayer, RandomPlayer, BestPlayer
 
 # 실험에 사용할 하이퍼파라미터 설정
-if False:
+if True:
     config = {
         'game': 'ttt', # 게임 종류: 틱택토
         'n_sim': 100, # MCTS 시뮬레이션 횟수

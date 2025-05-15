@@ -147,147 +147,176 @@ class MuZeroNN(torch.nn.Module):
         P = softmax(P.squeeze().detach().numpy())  # 예측된 정책 값을 소프트맥스 함수를 사용해 확률로 변환
         return v, P
     
-    def fit(self, data, n_iter=None, batch_size=None, lr=None, progress=None):
-        # MuZero 학습 구현 (실제로는 더 복잡하지만 간단하게 구현)
-        if n_iter is not None:
-            self.n_iter = n_iter
-
-        if batch_size is not None:
-            self.batch_size = batch_size
-
-        if lr is not None:
-            self.lr = lr
-
+    def fit(self, data, n_iter=None, batch_size=None, lr=None, progress=None, K=3):
+        # 기본 설정
+        if n_iter is not None: self.n_iter = n_iter
+        if batch_size is not None: self.batch_size = batch_size
+        if lr is not None: self.lr = lr
         self.train()
-
-        # backward compatibility: AlphaZero-style data
-        is_muzero_data = False
-        if len(data) > 0 and isinstance(data[0], tuple) and len(data[0]) == 6:
-            is_muzero_data = True
-
-        if not is_muzero_data:
-            # fallback to old style (state, policy, value)
-            states, policies, values = zip(*data)
-            states = torch.stack(states)
-            policies = torch.stack(policies)
-            values = torch.stack(values)
-            dataset = torch.utils.data.dataset.TensorDataset(states, policies, values)
-            loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        else:
-            # MuZero: (state, policy, value, action, reward, next_state)
-            states, policies, values, actions, rewards, next_states = zip(*data)
-            states = torch.stack(states)
-            policies = torch.stack(policies)
-            values = torch.stack(values)
-            actions = torch.tensor(actions, dtype=torch.long, device=states.device)
+        
+        # 데이터 준비 (MuZero는 항상 6개 항목: state, policy, value, action, reward, next_state)
+        sample0 = data[0]
+        
+        # K-step 데이터인지 확인 (action이 리스트/배열이면 K-step)
+        is_kstep = isinstance(sample0[3], (list, tuple)) and len(sample0[3]) > 1
+        
+        # 데이터 처리
+        states, policies, values, actions, rewards, next_states = zip(*data)
+        states = torch.stack(states)
+        policies = torch.stack(policies)
+        values = torch.stack(values)
+        
+        if is_kstep:  # K-step 데이터
+            actions = torch.stack([torch.tensor(a, dtype=torch.long, device=states.device) for a in actions])
+            rewards = torch.stack([torch.tensor(r, dtype=torch.float32, device=states.device) for r in rewards])
+        else:  # 1-step 데이터
+            # action이 배열/리스트인지 다시 확인 (일관성 유지)
+            if all(isinstance(a, (list, tuple)) or (isinstance(a, torch.Tensor) and a.dim() > 0 and a.size(0) > 1) for a in actions):
+                # 첫번째 action만 사용
+                actions = torch.tensor([a[0] if isinstance(a, (list, tuple)) else a[0].item() if isinstance(a, torch.Tensor) else int(a) for a in actions], 
+                                  dtype=torch.long, device=states.device)
+            else:
+                actions = torch.tensor([a.item() if isinstance(a, torch.Tensor) and a.dim() == 0 else int(a) for a in actions], 
+                                  dtype=torch.long, device=states.device)
             rewards = torch.stack(rewards).squeeze(-1)
-            next_states = torch.stack(next_states)
-            dataset = torch.utils.data.dataset.TensorDataset(states, policies, values, actions, rewards, next_states)
-            loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-
-        # 각 네트워크별 옵티마이저 생성 (개선점 1: 네트워크별 최적화 분리)
+        
+        next_states = torch.stack(next_states)
+        dataset = torch.utils.data.dataset.TensorDataset(states, policies, values, actions, rewards, next_states)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        # 옵티마이저 설정
         rep_optimizer = torch.optim.Adam(self.representation_nn.parameters(), lr=self.lr)
         dyn_optimizer = torch.optim.Adam(self.dynamics_nn.parameters(), lr=self.lr)
         pred_optimizer = torch.optim.Adam(self.prediction_nn.parameters(), lr=self.lr)
-
+        
+        # 학습 진행 표시
         task = None
         if progress is not None:
             task = progress[0].add_task("Training MuZero", total=n_iter, arg1_n="loss", arg1="N/A")
-
+        
         losses = []
         for iter_idx in range(self.n_iter):
-            rep_loss_total = 0.0  # 추가: representation loss 추적
+            rep_loss_total = 0.0
             dyn_loss_total = 0.0
             consistency_loss_total = 0.0
             reward_loss_total = 0.0
             value_loss_total = 0.0
             policy_loss_total = 0.0
             total_batches = 0
-
+            
             for batch in loader:
-                if not is_muzero_data:
-                    state_batch, policy_batch, value_batch = batch
+                s_batch, p_batch, v_batch, a_batch, r_batch, ns_batch = batch
+                batch_size = s_batch.size(0)
+                
+                # K-step 모드와 1-step 모드 구분
+                if is_kstep or (hasattr(a_batch, 'shape') and a_batch.dim() > 1):
+                    # === K-step 모드 ===
+                    rollout_K = min(K, a_batch.shape[1])
+                    latent_state = self.representation_nn(s_batch)
+                    loss = 0.0
                     
-                    # prediction loss
+                    for k in range(rollout_K):
+                        # 현재 latent에서 가치와 정책 예측
+                        pred_value, pred_policy = self.prediction_nn(latent_state)
+                        value_loss = torch.nn.functional.mse_loss(pred_value, v_batch)
+                        policy_loss = torch.nn.functional.cross_entropy(pred_policy, torch.argmax(p_batch, dim=1))
+                        
+                        # k=0일 때는 보상 예측이 없음 (첫 상태)
+                        if k == 0:
+                            reward_pred = torch.zeros_like(r_batch[:, k])
+                        else:
+                            reward_pred = pred_reward
+                            reward_loss = torch.nn.functional.mse_loss(reward_pred, r_batch[:, k])
+                            loss += reward_loss
+                            reward_loss_total += reward_loss.item() * batch_size
+                        
+                        loss += value_loss + policy_loss
+                        value_loss_total += value_loss.item() * batch_size
+                        policy_loss_total += policy_loss.item() * batch_size
+                        
+                        # 배치가 짧으면 중단
+                        if k >= a_batch.shape[1]-1:
+                            break
+                        
+                        # 다음 latent state로 전개
+                        latent_list, reward_list = [], []
+                        for i in range(batch_size):
+                            latent, pred_reward = self.dynamics_nn(latent_state[i], a_batch[i][k].item())
+                            latent_list.append(latent)
+                            reward_list.append(pred_reward)
+                        latent_state = torch.stack(latent_list)
+                        pred_reward = torch.stack(reward_list)
+                    
+                    # 역전파 및 파라미터 업데이트
+                    rep_optimizer.zero_grad()
+                    dyn_optimizer.zero_grad()
                     pred_optimizer.zero_grad()
-                    latent_states = self.representation_nn(state_batch)
-                    pred_values, pred_policies = self.prediction_nn(latent_states)
-                    value_loss = torch.nn.functional.mse_loss(pred_values, value_batch)
-                    policy_loss = torch.nn.functional.cross_entropy(pred_policies, torch.argmax(policy_batch, dim=1))
+                    loss.backward()
+                    rep_optimizer.step()
+                    dyn_optimizer.step()
+                    pred_optimizer.step()
+                    dyn_loss_total += loss.item() * batch_size
+                else:
+                    # === 1-step 모드 ===
+                    # reward 형식 처리
+                    reward_target = r_batch[:, 0] if r_batch.dim() > 1 else r_batch
+                    
+                    # 1. Representation Network 학습
+                    rep_optimizer.zero_grad()
+                    latent_states = self.representation_nn(s_batch)
+                    target_next_latents = self.representation_nn(ns_batch)
+                    
+                    # 2. Dynamics Network 학습
+                    dyn_optimizer.zero_grad()
+                    pred_next_latents, pred_rewards = [], []
+                    for i in range(batch_size):
+                        pred_next_latent, pred_reward = self.dynamics_nn(latent_states[i].detach(), a_batch[i].item())
+                        pred_next_latents.append(pred_next_latent)
+                        pred_rewards.append(pred_reward)
+                    
+                    pred_next_latents = torch.stack(pred_next_latents)
+                    pred_rewards = torch.stack(pred_rewards)
+                    
+                    consistency_loss = torch.nn.functional.mse_loss(pred_next_latents, target_next_latents.detach())
+                    reward_loss = torch.nn.functional.mse_loss(pred_rewards, reward_target)
+                    dynamics_loss = consistency_loss + reward_loss
+                    dynamics_loss.backward()
+                    dyn_optimizer.step()
+                    
+                    # 3. Prediction Network 학습
+                    pred_optimizer.zero_grad()
+                    pred_values, pred_policies = self.prediction_nn(latent_states.detach())
+                    value_loss = torch.nn.functional.mse_loss(pred_values, v_batch)
+                    policy_loss = torch.nn.functional.cross_entropy(pred_policies, torch.argmax(p_batch, dim=1))
                     prediction_loss = value_loss + policy_loss
                     prediction_loss.backward()
                     pred_optimizer.step()
                     
-                    value_loss_total += value_loss.item() * state_batch.size(0)
-                    policy_loss_total += policy_loss.item() * state_batch.size(0)
-                    total_batches += state_batch.size(0)
-                    continue
-
-                state_batch, policy_batch, value_batch, action_batch, reward_batch, next_state_batch = batch
-                batch_size = state_batch.size(0)
+                    # 4. Representation Network 학습 (consistency 손실)
+                    rep_optimizer.zero_grad()
+                    latent_states = self.representation_nn(s_batch)
+                    pred_next_latents = []
+                    for i in range(batch_size):
+                        pred_next_latent, _ = self.dynamics_nn(latent_states[i], a_batch[i].item())
+                        pred_next_latents.append(pred_next_latent)
+                    
+                    pred_next_latents = torch.stack(pred_next_latents)
+                    target_next_latents = self.representation_nn(ns_batch)
+                    rep_loss = torch.nn.functional.mse_loss(pred_next_latents.detach(), target_next_latents)
+                    rep_loss.backward()
+                    rep_optimizer.step()
+                    
+                    # 손실 합산
+                    rep_loss_total += rep_loss.item() * batch_size
+                    dyn_loss_total += dynamics_loss.item() * batch_size
+                    consistency_loss_total += consistency_loss.item() * batch_size
+                    reward_loss_total += reward_loss.item() * batch_size
+                    value_loss_total += value_loss.item() * batch_size
+                    policy_loss_total += policy_loss.item() * batch_size
                 
-                # 1. Representation Network 학습
-                rep_optimizer.zero_grad()
-                latent_states = self.representation_nn(state_batch)
-                target_next_latents = self.representation_nn(next_state_batch)
-                
-                # 2. Dynamics Network 학습 (실제 액션 기반)
-                dyn_optimizer.zero_grad()
-                pred_next_latents = []
-                pred_rewards = []
-                
-                for i in range(batch_size):
-                    # 개선점 2: 실제 게임에서 사용된 액션으로 학습
-                    pred_next_latent, pred_reward = self.dynamics_nn(latent_states[i].detach(), action_batch[i].item())
-                    pred_next_latents.append(pred_next_latent)
-                    pred_rewards.append(pred_reward)
-                
-                pred_next_latents = torch.stack(pred_next_latents)
-                pred_rewards = torch.stack(pred_rewards)
-                
-                # 개선점 3: Consistency Loss - 표현 일관성 손실 추가
-                consistency_loss = torch.nn.functional.mse_loss(pred_next_latents, target_next_latents.detach())
-                
-                # 개선점 4: 실제 보상 값으로 학습
-                reward_loss = torch.nn.functional.mse_loss(pred_rewards, reward_batch)
-                
-                dynamics_loss = consistency_loss + reward_loss
-                dynamics_loss.backward()
-                dyn_optimizer.step()
-                
-                # 3. Prediction Network 학습
-                pred_optimizer.zero_grad()
-                pred_values, pred_policies = self.prediction_nn(latent_states.detach())
-                value_loss = torch.nn.functional.mse_loss(pred_values, value_batch)
-                policy_loss = torch.nn.functional.cross_entropy(pred_policies, torch.argmax(policy_batch, dim=1))
-                prediction_loss = value_loss + policy_loss
-                prediction_loss.backward()
-                pred_optimizer.step()
-                
-                # 4. Representation Network도 consistency loss로 학습
-                rep_optimizer.zero_grad()
-                latent_states = self.representation_nn(state_batch)
-                pred_next_latents = []
-                
-                for i in range(batch_size):
-                    pred_next_latent, _ = self.dynamics_nn(latent_states[i], action_batch[i].item())
-                    pred_next_latents.append(pred_next_latent)
-                
-                pred_next_latents = torch.stack(pred_next_latents)
-                target_next_latents = self.representation_nn(next_state_batch)
-                rep_loss = torch.nn.functional.mse_loss(pred_next_latents.detach(), target_next_latents)
-                rep_loss.backward()
-                rep_optimizer.step()
-                
-                # 손실 합산
-                rep_loss_total += rep_loss.item() * batch_size
-                dyn_loss_total += dynamics_loss.item() * batch_size
-                consistency_loss_total += consistency_loss.item() * batch_size
-                reward_loss_total += reward_loss.item() * batch_size
-                value_loss_total += value_loss.item() * batch_size
-                policy_loss_total += policy_loss.item() * batch_size
                 total_batches += batch_size
-
+            
+            # 손실 평균 계산
             if total_batches == 0:
                 mean_losses = (0, 0)
             else:
@@ -296,15 +325,15 @@ class MuZeroNN(torch.nn.Module):
                     policy_loss_total / total_batches
                 )
             losses.append(mean_losses)
+            
+            # 진행 상황 표시
             if progress is not None:
-                loss_str = f'V:{mean_losses[0]:.5f} P:{mean_losses[1]:.5f}'
-                if is_muzero_data:
-                    rep_loss_mean = rep_loss_total / total_batches if total_batches > 0 else 0
-                    dyn_loss_mean = dyn_loss_total / total_batches if total_batches > 0 else 0
-                    reward_loss_mean = reward_loss_total / total_batches if total_batches > 0 else 0
-                    loss_str += f' R:{rep_loss_mean:.5f} D:{dyn_loss_mean:.5f} Rw:{reward_loss_mean:.5f}'
+                rep_loss_mean = rep_loss_total / total_batches if total_batches > 0 else 0
+                dyn_loss_mean = dyn_loss_total / total_batches if total_batches > 0 else 0
+                reward_loss_mean = reward_loss_total / total_batches if total_batches > 0 else 0
+                loss_str = f'V:{mean_losses[0]:.5f} P:{mean_losses[1]:.5f} R:{rep_loss_mean:.5f} D:{dyn_loss_mean:.5f} Rw:{reward_loss_mean:.5f}'
                 progress[0].update(task, advance=1, arg1=loss_str)
-
+        
         self.eval()
         return losses
     
