@@ -205,38 +205,52 @@ class MCTS:
             task = progress[0].add_task(f"[cyan]{progress[1]}: [green]Generating Data", total=n_games, arg1_n="#positions", arg1=0)
 
         def gen_game(gen: np.random.Generator):
+            # For MuZero, collect: (state, policy, value, action, reward, next_state)
             examples_per_game = []
-            game = self.ge.startingPosition() # 처음에는 3x3 모든 원소가 0임.
-            
-            # MuZero 모드에서는 추상 상태 표현 사용
+            game = self.ge.startingPosition()
             if self.is_muzero:
                 latent_game = self.ge.representation(game[-1])
-            
-            while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len): # gameOver 될 때 까지 도는데, max_len 만큼만 도는 것임.
-                pi = self.policy(game, nnet, gen) # PUCT 기반으로 선택된 정책 분포
-                examples_per_game.append([game.copy(), pi]) # append 는 리스트 값을 하나 맨 뒤에 추가하는 것
-
-                moves = self.ge.legalMoves(game) # 보드에서 빈 칸(놓을 수 있는) 찾아서 반환
-
+            prev_state = game.copy()
+            prev_latent = latent_game if self.is_muzero else None
+            done = False
+            while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len):
+                pi = self.policy(game, nnet, gen)
+                moves = self.ge.legalMoves(game)
                 p_pi = [pi[move] for move in moves]
                 if len(examples_per_game) < self.num_sampling_moves:
-                    move = moves[gen.choice(len(moves), p=p_pi)]
+                    move_idx = gen.choice(len(moves), p=p_pi)
                 else:
-                    move = moves[np.argmax(p_pi)]
+                    move_idx = np.argmax(p_pi)
+                move = moves[move_idx]
+                # Compute reward for transition
+                game_next = self.ge.makeMove(game, move)
+                # 개선점: 실제 턴별 보상 계산
+                reward = 0.0
+                if self.ge.gameOver(game_next):
+                    # 게임이 끝났을 때 승패 결과를 보상으로 사용
+                    reward = self.ge.outcome(game_next)
+                elif hasattr(self.ge, 'reward'):
+                    # reward 함수가 게임 엔진에 있으면 사용
+                    reward = self.ge.reward(game, move, game_next)
                 
-                # MuZero 모드에서는 동역학 모델 사용
+                # For MuZero, keep both obs and latent
                 if self.is_muzero:
-                    # 동역학 모델로 다음 상태와 보상 예측
                     latent_game_new, predicted_reward = self.ge.dynamics(latent_game, move)
-                    # 추상 상태 업데이트
+                    # Save (state, policy, value, action, reward, next_state)
+                    examples_per_game.append([
+                        prev_state.copy(), pi, None, move, reward, game_next.copy()
+                    ])
                     latent_game = latent_game_new
-                
-                # 실제 게임 상태 업데이트 (학습 및 평가용)
-                game = self.ge.makeMove(game, move)
-                
+                else:
+                    examples_per_game.append([
+                        prev_state.copy(), pi, None, move, reward, game_next.copy()
+                    ])
+                prev_state = game_next.copy()
+                game = game_next
+            # Compute value targets (bootstrapping from outcome)
             result = self.ge.outcome(game) * (-1) ** len(examples_per_game)
             for example in examples_per_game:
-                example.append(result)
+                example[2] = result  # value target
                 result = -result
             return examples_per_game
 
@@ -253,13 +267,29 @@ class MCTS:
         )
         data = []
         for gameData in examples:
-            data += [
-                self.ge.encodeStateAndOutput(state, policy, evaluation, device=self.device if device is None else device)
-                for state, policy, evaluation in gameData
-            ]
+            if self.is_muzero:
+                # gameData: list of (state, policy, value, action, reward, next_state)
+                for state, policy, value, action, reward, next_state in gameData:
+                    # Encode state and next_state for NN input
+                    state_enc, policy_enc, value_enc = self.ge.encodeStateAndOutput(state, policy, value, device=self.device if device is None else device)
+                    next_state_enc, _, _ = self.ge.encodeStateAndOutput(next_state, policy, value, device=self.device if device is None else device)
+                    # action index (int 0-8)
+                    if isinstance(action, int):
+                        action_idx = action
+                    else:
+                        # If action is move tuple, convert to index
+                        try:
+                            action_idx = self.ge.allMoves().index(action)
+                        except Exception:
+                            action_idx = int(action)
+                    reward_tensor = torch.tensor([reward], dtype=torch.float32, device=self.device if device is None else device)
+                    data.append((state_enc, policy_enc, value_enc, action_idx, reward_tensor, next_state_enc))
+            else:
+                # AlphaZero: (state, policy, value)
+                for state, policy, value, _, _, _ in gameData:
+                    data.append(self.ge.encodeStateAndOutput(state, policy, value, device=self.device if device is None else device))
             if progress is not None:
                 progress[0].update(task, advance=1, arg1=len(data))
-
         return data
 
 # Runs a game between model1 and model2 and returns the result
