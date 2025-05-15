@@ -14,7 +14,7 @@ from utils import get_freer_gpu
 from players import Player, NNPlayer, RandomPlayer, BestPlayer
 
 # 실험에 사용할 하이퍼파라미터 설정
-if False:
+if True:
     config = {
         'game': 'ttt', # 게임 종류: 틱택토
         'n_sim': 100, # MCTS 시뮬레이션 횟수
@@ -24,7 +24,7 @@ if False:
         'n_games_eval': 45, # 평가용 게임 수
         'n_iter': 10, # 전체 반복 횟수
         'n_jobs': 90, # 병렬 처리 작업 수
-        'use_muzero': False, # MuZero 알고리즘 사용 여부
+        'use_muzero': True, # MuZero 알고리즘 사용 여부
     }
 else:
     config = {
@@ -365,11 +365,8 @@ def finalnet(gameEngine, iterations=200, n_games_eval=400, device=[None, None]):
                     'data': data
                 }, f)
 
-            # 새 모델 초기화
-            if config['use_muzero']:
-                new_nnet = MuZeroNN(hidden_size=32).to(device[0])
-            else:
-                new_nnet = copy.deepcopy(nnet).to(device[0])
+            # 기존 모델 복사 (추후 학습 후 업데이트 위함)
+            new_nnet = copy.deepcopy(nnet).to(device[0])
 
             # BaseNN 의 fit() 함수는 데이터를 받아서 학습을 진행함.
             # 생성하나 게임 (n_gen_games) 만큼의 결과를 모아서 한 번에 학습 진행 (fit 함수가 그 역할 함)
