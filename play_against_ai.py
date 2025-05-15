@@ -33,7 +33,8 @@ def test_game_functionality():
     # 모델 불러오기
     model = BaseNN()
     try:
-        model.load_state_dict(torch.load('./models/tttbest.pt'))
+        model.load_state_dict(torch.load('./models/ttt_alphazero_best.pt'))
+        # model.load_state_dict(torch.load('./models/tttbest.pt'))
         print("✓ 모델 불러오기 성공")
     except FileNotFoundError:
         print("✗ 모델 파일을 찾을 수 없습니다.")
