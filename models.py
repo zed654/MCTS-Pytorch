@@ -48,57 +48,74 @@ class BaseNN(torch.nn.Module):
         return v, P
 
     def fit(self, data, n_iter=None, batch_size=None, lr=None, progress=None):
-        # 학습 데이터로 신경망 학습
-        # loss 계산, 역전파, 가중치 업데이트
+        # 학습 데이터로 신경망 학습하는 함수
+        
+        # 파라미터 값이 주어지면 클래스 변수 업데이트, 아니면 기본값 사용
         if n_iter is not None:
-            self.n_iter = n_iter
+            self.n_iter = n_iter  # 학습 반복 횟수 설정
 
         if batch_size is not None:
-            self.batch_size = batch_size
+            self.batch_size = batch_size  # 배치 크기 설정
 
         if lr is not None:
-            self.lr = lr
+            self.lr = lr  # 학습률 설정 (여기서 조정하면 loss 감소 속도 바꿀 수 있음)
 
-        self.train()
+        self.train()  # 신경망을 학습 모드로 설정 (드롭아웃, 배치정규화 등 활성화)
 
-        V, TP, TV = zip(*data)
-        V = torch.stack(V)
-        TP = torch.stack(TP)
-        TV = torch.stack(TV)
+        # 학습 데이터 준비: 상태(V), 정책(TP), 가치(TV)로 분리
+        V, TP, TV = zip(*data)  # data는 (상태, 정책, 가치) 튜플의 리스트
+        V = torch.stack(V)  # 상태 텐서 - 게임판 상태
+        TP = torch.stack(TP)  # 정책 텐서 - 어떤 수를 둘지에 대한 확률 분포
+        TV = torch.stack(TV)  # 가치 텐서 - 게임 결과 (-1, 0, 1)
+        
+        # PyTorch 데이터셋과 데이터로더 생성 (미니배치 학습 위함)
         dataset = torch.utils.data.dataset.TensorDataset(V, TP, TV)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size, shuffle=True)  # 데이터 섞어서 학습
 
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        # Adam 옵티마이저 생성 - 학습률(lr)이 여기서 설정됨
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)  # 학습률 낮추면 더 천천히 학습됨
 
+        # 손실 함수 정의 - MSE(평균제곱오차)와 Cross Entropy(교차 엔트로피) 사용
         def criterion(v, p, tv, tp):
             return (
-                torch.nn.functional.mse_loss(v, tv),
-                torch.nn.functional.cross_entropy(p, tp)
+                torch.nn.functional.mse_loss(v, tv),  # 가치 예측 손실 (회귀)
+                torch.nn.functional.cross_entropy(p, tp)  # 정책 예측 손실 (분류)
             )
 
+        # 진행 상황 표시용 설정
         task = None
         if progress is not None:
             task = progress[0].add_task("Training", total=n_iter, arg1_n="loss", arg1="N/A")
-        losses = []
+        losses = []  # 각 반복마다의 손실값 저장할 리스트
+        
+        # 학습 반복 시작
         for _ in range(self.n_iter):
-            cl = np.zeros(2)
+            cl = np.zeros(2)  # 현재 반복의 손실값 [가치 손실, 정책 손실]
+            
+            # 미니배치 학습
             for s, tp, tv in loader:
-                optimizer.zero_grad()
-                v, p = self(s)
-                loss = criterion(v, p, tv, tp)
+                optimizer.zero_grad()  # 그래디언트 초기화
+                v, p = self(s)  # 신경망에 상태 입력하여 가치와 정책 예측
+                loss = criterion(v, p, tv, tp)  # 손실 계산
+                
+                # 현재 배치의 손실값 누적
                 for i in range(2):
                     cl[i] += loss[i].item() * len(s)
-                loss = loss[0] + loss[1]
-                loss.backward()
-                optimizer.step()
-            cl /= len(data)
-            losses.append(cl)
+                
+                loss = loss[0] + loss[1]  # 두 손실 합침 (여기서 가중치 조절 가능!)
+                loss.backward()  # 역전파 - 그래디언트 계산
+                optimizer.step()  # 가중치 업데이트
+            
+            cl /= len(data)  # 평균 손실값 계산
+            losses.append(cl)  # 손실값 저장
+            
+            # 진행 상황 업데이트
             if progress is not None:
                 progress[0].update(task, advance=1, arg1=f'{cl.sum():.5f} = {cl[0]:.5f} + {cl[1]:.5f}')
 
-        self.eval()
+        self.eval()  # 학습 완료 후 평가 모드로 전환
 
-        return losses
+        return losses  # 모든 반복의 손실값 반환
 
     def id(self):
         # 모델의 고유 식별자 반환
