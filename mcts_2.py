@@ -205,54 +205,56 @@ class MCTS:
             task = progress[0].add_task(f"[cyan]{progress[1]}: [green]Generating Data", total=n_games, arg1_n="#positions", arg1=0)
 
         def gen_game(gen: np.random.Generator):
-            # For MuZero, collect: (state, policy, value, action, reward, next_state)
-            examples_per_game = []
-            game = self.ge.startingPosition()
-            if self.is_muzero:
+            if not self.is_muzero:
+                # AlphaZero-style game generation
+                examples = []
+                game = self.ge.startingPosition()
+                while not self.ge.gameOver(game):
+                    pi = self.policy(game, nnet, gen)
+                    moves = self.ge.legalMoves(game)
+                    p_pi = [pi[move] for move in moves]
+                    move = moves[gen.choice(len(moves), p=p_pi)]
+                    examples.append([game.copy(), pi])
+                    game = self.ge.makeMove(game, move)
+                result = self.ge.outcome(game) * (-1) ** len(examples)
+                for example in examples:
+                    example.append(result)
+                    result = -result
+                return examples
+            else:
+                # Existing MuZero version (unchanged)
+                examples_per_game = []
+                game = self.ge.startingPosition()
                 latent_game = self.ge.representation(game[-1])
-            prev_state = game.copy()
-            prev_latent = latent_game if self.is_muzero else None
-            done = False
-            while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len):
-                pi = self.policy(game, nnet, gen)
-                moves = self.ge.legalMoves(game)
-                p_pi = [pi[move] for move in moves]
-                if len(examples_per_game) < self.num_sampling_moves:
-                    move_idx = gen.choice(len(moves), p=p_pi)
-                else:
-                    move_idx = np.argmax(p_pi)
-                move = moves[move_idx]
-                # Compute reward for transition
-                game_next = self.ge.makeMove(game, move)
-                # 개선점: 실제 턴별 보상 계산
-                reward = 0.0
-                if self.ge.gameOver(game_next):
-                    # 게임이 끝났을 때 승패 결과를 보상으로 사용
-                    reward = self.ge.outcome(game_next)
-                elif hasattr(self.ge, 'reward'):
-                    # reward 함수가 게임 엔진에 있으면 사용
-                    reward = self.ge.reward(game, move, game_next)
-                
-                # For MuZero, keep both obs and latent
-                if self.is_muzero:
-                    latent_game_new, predicted_reward = self.ge.dynamics(latent_game, move)
-                    # Save (state, policy, value, action, reward, next_state)
+                prev_state = game.copy()
+                prev_latent = latent_game # 추후 self.ge.dynamics(prev_latent, move) 로 테스트해보면 좋을듯
+                while not self.ge.gameOver(game) and (max_len == -1 or len(examples_per_game) < max_len):
+                    pi = self.policy(game, nnet, gen)
+                    moves = self.ge.legalMoves(game)
+                    p_pi = [pi[move] for move in moves]
+                    if len(examples_per_game) < self.num_sampling_moves:
+                        move_idx = gen.choice(len(moves), p=p_pi)
+                    else:
+                        move_idx = np.argmax(p_pi)
+                    move = moves[move_idx]
+                    game_next = self.ge.makeMove(game, move)
+                    reward = 0.0
+                    if self.ge.gameOver(game_next):
+                        reward = self.ge.outcome(game_next)
+                    elif hasattr(self.ge, 'reward'):
+                        reward = self.ge.reward(game, move, game_next)
+                    latent_game_new, _ = self.ge.dynamics(latent_game, move)
                     examples_per_game.append([
                         prev_state.copy(), pi, None, move, reward, game_next.copy()
                     ])
                     latent_game = latent_game_new
-                else:
-                    examples_per_game.append([
-                        prev_state.copy(), pi, None, move, reward, game_next.copy()
-                    ])
-                prev_state = game_next.copy()
-                game = game_next
-            # Compute value targets (bootstrapping from outcome)
-            result = self.ge.outcome(game) * (-1) ** len(examples_per_game)
-            for example in examples_per_game:
-                example[2] = result  # value target
-                result = -result
-            return examples_per_game
+                    prev_state = game_next.copy()
+                    game = game_next
+                result = self.ge.outcome(game) * (-1) ** len(examples_per_game)
+                for example in examples_per_game:
+                    example[2] = result
+                    result = -result
+                return examples_per_game
 
         # 병렬로 여러 게임 생성
         # examples 에 시뮬레이션된 게임들이 모여짐
