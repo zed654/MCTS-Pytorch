@@ -22,7 +22,7 @@ if True:
         'n_train_iter': 100, # 신경망 학습 반복 횟수
         'batch_size': 1024,
         'n_games_eval': 45, # 평가용 게임 수
-        'n_iter': 10, # 전체 반복 횟수
+        'n_iter': 30, # 전체 반복 횟수
         'n_jobs': 90, # 병렬 처리 작업 수
         'use_muzero': True, # MuZero 알고리즘 사용 여부
         'n_unroll_steps': 3, # 몬테카를로 트리 탐색 시 탐색 깊이
